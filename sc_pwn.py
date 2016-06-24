@@ -260,6 +260,9 @@ class FSB:
         return self.__fsb
 
     def gen(self,fsb):
+        n_idx = fsb.find('\x00')
+        if n_idx >= 0:
+            warn('FSB(gen) : null character detected(%d)' % (len(self.__fsb)+n_idx+1))
         self.__fsb += fsb
         return '' if self.padding else fsb
     
@@ -1033,9 +1036,8 @@ class Shell:
             self.cmn.is_alive = False
         
     def interact(self):
-        get_tty = False
-
         if self.is_implemented('python') and raw_input('Need TTY?(y/n)').lower()=='y':
+            get_tty = True
             if 'euid' in self.command('id'):
                 if self.is_implemented('gcc') and self.is_implemented('base64'):
                     setreuid = '#include<stdlib.h>\n#include<unistd.h>\nmain(){setreuid(geteuid(),-1);execl("/bin/sh","/bin/sh",NULL);}'
@@ -1043,9 +1045,9 @@ class Shell:
                     self.upload('setreuid.c', setreuid)
                     self.command('gcc setreuid.c -o setreuid && ./setreuid; exit')
                     self.command('cd - > /dev/null')
-                    get_tty = True
-            else:
-                get_tty = True
+        else:
+            get_tty = False
+            
 
         if get_tty:
             shells = []
