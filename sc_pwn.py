@@ -5,6 +5,7 @@ from string import strip
 from struct import pack,unpack
 from base64 import b64encode, b64decode
 from time import sleep
+import re
 
 lhp     = ('www.shift-crops.net',4296)
 
@@ -314,7 +315,9 @@ class Communicate:
             self.channel.close()
             if self.disp:
                 proc('Session Disconnect...')
-        raw_input('Enter any key to continue...')
+                
+        if self.disp:
+            raw_input('Enter any key to close...')
 
 #==========
 
@@ -505,6 +508,115 @@ class ELF:
                 
         fail('ROPgadgets "%s" not found...' % str(keyword))
         return None
+
+class libcDB:
+    def __init__(self, libc_id=None, **symbol):
+        import urllib2
+        
+        self.url = 'libcdb.com'
+        self.urllib2 = urllib2
+        self.libc_id = libc_id if libc_id else self.libc(symbol.items())
+
+    def libc(self, symbols):
+        if len(symbols)<2:
+            fail('numbler of symbols must be greater than 2')
+            return None
+        
+        symA = 'symbolA=%s&addressA=0x%x' % symbols[0]
+        symB = 'symbolB=%s&addressB=0x%x' % symbols[1]
+
+        search_url = 'http://%s/search?%s&%s' % (self.url, symA, symB)
+        rsp     = self.urllib2.urlopen(search_url)
+        data    = rsp.read()
+
+        if 'no items found' in data:
+            fail('no libc found')
+            return None
+        
+        r = re.compile('<a href="/libc/([0-9]+)">Libc: ([a-z0-9._-]+)</a></li>')
+        libc_list = dict()
+        for libc in r.findall(data):
+            if (self.symbol(symbols[0][0], int(libc[0]))^symbols[0][1])&0xfff == 0:
+                libc_list[int(libc[0])]=libc[1]
+
+        if not len(libc_list):
+            fail('no libc found')
+            return None
+        elif len(libc_list)>1:
+            sys.stdout.write('Select libc\n')
+            for libc in libc_list.items():
+                sys.stdout.write('%d : %s\n' % libc)
+                
+            libc_id = None
+            while libc_id not in libc_list:
+                libc_id = int(raw_input('... '))
+        else:
+            libc_id = libc_list.keys()[0]
+            
+        info('libc "%s" found' % libc_list[libc_id])
+        return libc_id
+
+    def symbol(self, name, libc_id=None):
+        if libc_id is None:
+            libc_id = self.libc_id
+        if libc_id is None:
+            return None
+        
+        search_url = 'http://%s/libc/%d/symbols?name=%s' % (self.url, libc_id, name)
+        rsp     = self.urllib2.urlopen(search_url)
+        data    = rsp.read()
+
+        if 'no symbols found' in data:
+            fail('no symbols found')
+            return None
+
+        r = re.compile('<dt>%s</dt>\n[ ]*<dd>libc_base \+ (0x[0-9a-f]+)</dd>' % name)
+        return int(r.search(data).group(1),16)
+
+    def string(self, needle, libc_id=None):
+        if libc_id is None:
+            libc_id = self.libc_id
+        if libc_id is None:
+            return None
+        
+        search_url = 'http://%s/libc/%d/strings?needle=%s' % (self.url, libc_id, needle)
+        rsp     = self.urllib2.urlopen(search_url)
+        data    = rsp.read()
+
+        if 'no strings found' in data:
+            fail('no strings found')
+            return None
+
+        r = re.compile('<li>libc_base \+ (0x[0-9a-f]+)</li>')
+        return int(r.search(data).group(1),16)
+
+    def download(self, fname=None, libc_id=None):
+        if libc_id is None:
+            libc_id = self.libc_id
+        if libc_id is None:
+            return None
+
+        detail_url = 'http://%s/libc/%d' % (self.url, libc_id)
+        rsp     = self.urllib2.urlopen(detail_url)
+        data    = rsp.read()
+
+        r = re.compile('<a href="/media/libcs/([a-z0-9._-]+)">')
+        libc_name = r.search(data).group(1)
+
+        if fname is None:
+            fname = libc_name
+        if os.path.isfile(fname):
+            warn('"%s" already exists' % fname)
+            return fname
+        
+        proc('Downloading "%s" to "./%s"' % (libc_name, fname))        
+        download_url = 'http://%s/media/libcs/%s' % (self.url, libc_name)
+        rsp     = self.urllib2.urlopen(download_url)
+        data    = rsp.read()
+
+        open(fname, 'wb').write(data)
+        
+        return fname
         
 #==========
 
