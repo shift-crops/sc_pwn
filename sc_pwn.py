@@ -36,14 +36,18 @@ PREV_INUSE          = 0b001
 IS_MMAPED           = 0b010
 IS_NON_MAINARENA    = 0b100
 
-fsb_len     = lambda x:    "%6$"+str(x if x>0 else 0x10000+x)+"x" if x!=0 else ""
-heap_sb     = lambda x,y:  (x&~0b111)|y
-pack_16     = lambda x:    pack('<H' if x > 0 else '<h',x)
-pack_32     = lambda x:    pack('<I' if x > 0 else '<i',x)
-pack_64     = lambda x:    pack('<Q' if x > 0 else '<q',x)
-unpack_16   = lambda x:    unpack('<H',x)[0]
-unpack_32   = lambda x:    unpack('<I',x)[0]
-unpack_64   = lambda x:    unpack('<Q',x)[0]
+fsb_len     = lambda x:         "%6$"+str(x if x>0 else 0x10000+x)+"x" if x!=0 else ""
+heap_sb     = lambda x,y:       (x&~0b111)|y
+pack_8      = lambda x:         pack('<B' if x > 0 else '<b',x)
+pack_16     = lambda x:         pack('<H' if x > 0 else '<h',x)
+pack_32     = lambda x:         pack('<I' if x > 0 else '<i',x)
+pack_64     = lambda x:         pack('<Q' if x > 0 else '<q',x)
+unpack_8    = lambda x,s=False: unpack('<B' if not s else '<b',x)[0]
+unpack_16   = lambda x,s=False: unpack('<H' if not s else '<h',x)[0]
+unpack_32   = lambda x,s=False: unpack('<I' if not s else '<i',x)[0]
+unpack_64   = lambda x,s=False: unpack('<Q' if not s else '<q',x)[0]
+mold_32     = lambda x:         (x+'\x00'*(4-len(x)))[:4]
+mold_64     = lambda x:         (x+'\x00'*(8-len(x)))[:8]
 rol         = lambda val, r_bits, max_bits: \
               (val << r_bits%max_bits) & (2**max_bits-1) | \
               ((val & (2**max_bits-1)) >> (max_bits-(r_bits%max_bits)))
@@ -84,7 +88,7 @@ class Environment:
 
     def set_item(self, name, **obj):
         if obj.keys()!=self.env_list:
-            warn('environment name does not match')
+            fail('Environment : "%s" environment does not match' % name)
             return
         
         for env in obj:
@@ -92,12 +96,14 @@ class Environment:
 
     def select(self, env=None):
         if env is not None and env not in self.env_list:
-            warn('"%s" is not defined' % env)
+            warn('Environment : "%s" is not defined' % env)
             
         while env is None or env not in self.env_list:
             env = raw_input('Select Environment\n%s ...' % str(self.env_list))
+            if env=='':
+                env = self.env_list[0]
 
-        info('set environment "%s"' % env)
+        info('Environment : set environment "%s"' % env)
         for name,obj in getattr(self, env).items():
             setattr(self, name, obj)
         self.__env = env
@@ -127,6 +133,16 @@ class Communicate:
         elif isinstance(target, str):
             target = {'program':target}
 
+        # environment
+        if self.mode!='SOCKET':
+            env_dict    = dict()
+            env_str     = ''
+            if 'env' in args and isinstance(args['env'] ,dict):
+                env_dict.update(args['env'])
+                for e in args['env'].items():
+                    info('set env "%s": %s' % e)
+                    env_str += '%s="%s" ' % e
+
         if self.mode=='SOCKET':
             import socket
             
@@ -139,33 +155,23 @@ class Communicate:
             
         elif self.mode=='LOCAL':
             import subprocess
-            
-            e = None
+                        
             if self.disp:
                 proc('Starting program: %s' % target['program'])
             if 'GDB' in args and isinstance(args['GDB'] ,(int,long)):
-                shell = False
-                
-                if 'lib' in args:
-                    info('LD_PRELOAD: %s' % args['lib'])
-                    wrapper = '--wrapper env LD_PRELOAD=%s --' % args['lib']
-                else:
-                    wrapper = ''
-                    
-                target['program'] = ('gdbserver %s localhost:%d %s' % (wrapper, args['GDB'], target['program'])).split(' ')
-            elif 'ASLR' in args and not args['ASLR']:
                 shell = True
-                target['program'] = 'ulimit -s unlimited; setarch i386 -R %s' % target['program']
+                wrapper = ('--wrapper env %s --' % env_str) if env_str else ''    
+                target['program'] = 'gdbserver %s localhost:%d %s' % (wrapper, args['GDB'], target['program'])
+            elif 'ASLR' in args and args['ASLR']==False:
+                shell = True
+                target['program'] = 'ulimit -s unlimited; %s setarch i386 -R %s' % (env_str, target['program'])
             else:
                 shell = False
                 target['program'] = target['program'].split(' ')
-                if 'lib' in args:
-                    info('LD_PRELOAD: %s' % args['lib'])
-                    e = {'LD_PRELOAD':args['lib']}
 
             self.wait = ('wait' in args and args['wait'])
                 
-            self.proc = subprocess.Popen(target['program'], shell=shell, env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.proc = subprocess.Popen(target['program'], shell=shell, env=env_dict, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             info('PID : %d' % self.proc.pid)
             self.set_nonblocking(self.proc.stdout)
             if target['program'][0]=='gdbserver':
@@ -185,9 +191,12 @@ class Communicate:
             self.channel = self.ssh.get_transport().open_session()
             self.channel.settimeout(args['to'] if 'to' in args else 1.0)
             self.channel.get_pty()
-            if 'ASLR' in args and args['ASLR']==False:
-                target['program'] = 'ulimit -s unlimited; setarch i386 -R %s' % target['program']
-            self.channel.exec_command(target['program'])
+            if 'program' in target:
+                if 'ASLR' in args and args['ASLR']==False:
+                    target['program'] = 'ulimit -s unlimited; %s setarch i386 -R %s' % (env_str, target['program'])
+                elif env_str:
+                    target['program'] = '%s %s' % (env_str, target['program'])
+                self.channel.exec_command(target['program'])
 
     def set_show(self, mode=None):
         if mode in ['RAW', 'HEXDUMP']:
@@ -281,7 +290,7 @@ class Communicate:
     def read_until(self,term='\n',contain=True):
         rsp = ''
         try:
-            while not rsp.endswith(term):
+            while not (rsp.endswith(term) if isinstance(term, str) else any([rsp.endswith(x) for x in term])):
                 if self.mode=='SOCKET':
                     rsp += self.sock.recv(1) 
                 elif self.mode=='LOCAL':
@@ -322,22 +331,66 @@ class Communicate:
 #==========
 
 class ELF:
-    def __init__(self, path, **args):
-        try:
-            from elftools.elf.elffile import ELFFile
-            from elftools.elf.sections import SymbolTableSection
-
-            self.__symbolTableSection = SymbolTableSection
-        except:
-            fail('module "elftools" is not importable')
-            return
-
-        proc('Loading "%s"...' % path)
-        self.elf    = ELFFile(open(path,'rb'))
-        self.path   = path
+    def __init__(self, path, mode='elftools', **args):
+        self.path = path
         
-        self.arch   = self.elf.get_machine_arch().lower()
-        self.pie    = 'DYN' in self.elf.header.e_type
+        if mode not in ['elftools','binutils']:
+            warn('ELF : mode "%s" is not defined' % mode)
+            mode = None
+        self.mode = mode
+
+        if self.mode is None or self.mode=='elftools':
+            try:
+                from elftools.elf.elffile import ELFFile
+                from elftools.elf.sections import SymbolTableSection
+
+                self.__ELFFile              = ELFFile
+                self.__symbolTableSection   = SymbolTableSection
+                self.mode                   = 'elftools'
+            except:
+                fail('ELF : module "elftools" is not importable')
+                self.mode = None
+
+        if self.mode is None or self.mode=='binutils':
+            try:
+                from subprocess import call, check_output
+                import os
+
+                devnull = open(os.devnull, 'w')
+                call('readelf', stdout=devnull, stderr=devnull)
+                #call('objdump', stdout=devnull, stderr=devnull)
+                #call('nm', stdout=devnull, stderr=devnull)
+                devnull.close()
+
+                env = {'LANG':'en'}
+                self.__readelf  = lambda opt: check_output(['readelf', opt, self.path], env=env)
+                #self.__objdump  = lambda opt: check_output(['objdump', opt, self.path], env=env)
+                #self.__nm       = lambda opt: check_output(['nm', opt, self.path], env=env)
+                self.mode       = 'binutils'
+            except:
+                fail('ELF : command "readelf" is not callable')
+                self.mode = None
+
+        if self.mode:
+            self.initialize(args)
+
+    def initialize(self, args):
+        proc('Loading "%s"...' % self.path)
+
+        if self.mode=='elftools':
+            self.elf    = self.__ELFFile(open(self.path,'rb'))
+
+            self.pie    = 'DYN' in self.elf.header.e_type
+            self.arch   = self.elf.get_machine_arch().lower()
+            
+        elif self.mode=='binutils':
+            h_elf       = self.__readelf('-h')
+            pattern     = 'Type:\s+([^\n]+)\s+Machine:\s+([^\n]+)'
+
+            m = re.search(pattern, h_elf)
+            self.pie    = 'DYN' in m.group(1)
+            self.arch   = m.group(2).lower().split()[-1]
+        
         self.base   = args['base'] if 'base' in args and self.pie else 0
         
         self.__section                  = self.init_sections()
@@ -348,51 +401,97 @@ class ELF:
         self.__list_gadgets             = self.init_ropgadget() if 'rop' in args and args['rop'] else None
 
     def init_sections(self):
-        self.__list_sections = list(self.elf.iter_sections())
-        
         section = dict()
-        for sec in self.__list_sections:
-            section[sec.name]  = sec.header.sh_addr
+        
+        if self.mode=='elftools':
+            self.__list_sections = list(self.elf.iter_sections())
+            
+            for sec in self.__list_sections:
+                section[sec.name]  = sec.header.sh_addr
+                
+        elif self.mode=='binutils':
+            h_sections  = self.__readelf('-S')
+            pattern     = '\d] ([^ ]+)\D+([0-9a-f]+)'
+
+            r = re.compile(pattern)
+            for sec in r.findall(h_sections):
+                section[sec[0]]  = int(sec[1],16)
+
         return section
 
     def init_got(self):
-        sec_rel_plt = self.elf.get_section_by_name('.rel.plt' if self.arch == 'x86' else '.rela.plt')
-        sym_rel_plt = self.__list_sections[sec_rel_plt.header.sh_link]
-
         got = dict()
-        for rel in sec_rel_plt.iter_relocations():
-            sym_idx = rel.entry.r_info_sym
-            sym     = sym_rel_plt.get_symbol(sym_idx)
-            got[sym.name]  = rel.entry.r_offset
+        name_rel_plt = '.rel.plt' if self.arch in ['x86', '80386'] else '.rela.plt'
+
+        if self.mode=='elftools':
+            sec_rel_plt = self.elf.get_section_by_name(name_rel_plt)
+            sym_rel_plt = self.__list_sections[sec_rel_plt.header.sh_link]
+
+            for rel in sec_rel_plt.iter_relocations():
+                sym_idx = rel.entry.r_info_sym
+                sym     = sym_rel_plt.get_symbol(sym_idx)
+                got[sym.name]  = rel.entry.r_offset
+
+        elif self.mode=='binutils':
+            h_reloc     = self.__readelf('-r')
+            pattern     = '([0-9a-f]+)  ([^ ]+[ ]+){3}(\w+)'
+            
+            for header in h_reloc.split('Relocation section'):
+                if name_rel_plt in header:
+                    h_rel_plt = header
+                    break
+
+            r = re.compile(pattern)
+            for rel in r.findall(h_rel_plt):
+                got[rel[2]]  = int(rel[0],16)
+                
         return got
 
     def init_plt(self):
-        if self.arch in ('x86','x64','amd64'):
+        addr_plt = self.__section['.plt']
+        if self.arch in ('x86','x64','amd64','80386','x86-64'):
             header_size, entry_size = 0x10, 0x10
-                
-        sec_plt     = self.elf.get_section_by_name('.plt')
 
+        '''
+        sec_plt     = self.elf.get_section_by_name('.plt')
         plt = {u'resolve' : sec_plt.header.sh_addr}
         addr_plt_entry = sec_plt.header.sh_addr + header_size
+        '''
+        plt = {'resolve' : addr_plt}
+        addr_plt_entry = addr_plt + header_size
         for name, addr in sorted(self.__got.items(), key=lambda x:x[1]):
             plt[name] = addr_plt_entry
             addr_plt_entry += entry_size
+
         return plt
 
     def init_symbols(self):
         symbol      = dict()
         function    = dict()
-        
-        for sec in self.__list_sections:
-            if not isinstance(sec, self.__symbolTableSection):
-                continue
-            
-            for sym in sec.iter_symbols():
-                if sym.entry.st_value:
-                    if sym.entry.st_info['type'] == 'STT_FUNC':
-                        function[sym.name]  = sym.entry.st_value
-                    else:
-                        symbol[sym.name]    = sym.entry.st_value
+
+        if self.mode=='elftools':
+            for sec in self.__list_sections:
+                if not isinstance(sec, self.__symbolTableSection):
+                    continue
+                
+                for sym in sec.iter_symbols():
+                    if sym.entry.st_value:
+                        if sym.entry.st_info['type'] == 'STT_FUNC':
+                            function[sym.name]  = sym.entry.st_value
+                        else:
+                            symbol[sym.name]    = sym.entry.st_value
+
+        elif self.mode=='binutils':
+            h_symbol    = self.__readelf('-s')
+            pattern     = '\d+: ([0-9a-f]+)\s+\d+ (\w+)\D+\d+ ([^\s@]+)'
+
+            r = re.compile(pattern)
+            for sym in r.findall(h_symbol):
+                if sym[1]=='FUNC':
+                    function[sym[2]]  = int(sym[0],16)
+                else:
+                    symbol[sym[2]]  = int(sym[0],16)
+
         return symbol, function
         
     def init_ropgadget(self):
@@ -400,7 +499,7 @@ class ELF:
             from ropgadget.args import Args
             from ropgadget.core import Core
         except:
-            fail('module "ropgadget" is not importable')
+            fail('ELF : module "ropgadget" is not importable')
             return None
 
         c = Core(Args(('--console',)).getArgs())
@@ -414,86 +513,95 @@ class ELF:
 
     def set_location(self, symbol, addr):
         if not self.pie:
-            fail('"%s" is not PIE' % self.path)
+            fail('ELF : "%s" is not PIE' % self.path)
             return
 
         if self.base:
-            warn('Base address is already set')
+            warn('ELF : Base address is already set')
 
         if symbol in self.__function:
             self.base = addr - self.__function[symbol] 
         elif symbol in self.__symbol:
             self.base = addr - self.__symbol[symbol]
         else:
-            fail('symbol "%s" not found' % symbol)
+            fail('ELF : symbol "%s" not found' % symbol)
             return
         
-        info('Base address(%s) is 0x%08x' % (self.path, self.base))
-        if self.base & 0xff:
-            warn('Base address is maybe wrong')
+        info('"%s" is loaded on 0x%08x' % (self.path, self.base))
+        if self.base & 0xfff:
+            warn('ELF : Base address(%s) is maybe wrong' % self.path)
 
     def search(self, data, *section):
-        if len(section):
-            section = list(self.elf.get_section_by_name(k) for k in section)
-        else:
-            section = self.__list_sections
+        if self.mode=='elftools':
+            if len(section):
+                section = list(self.elf.get_section_by_name(k) for k in section)
+            else:
+                section = self.__list_sections
 
-        for sec in section:
-            if data in sec.data():
-                return self.base + sec.header.sh_addr + sec.data().find(data)
+            for sec in section:
+                if data in sec.data():
+                    return self.base + sec.header.sh_addr + sec.data().find(data)
+
+        elif self.mode=='binutils':
+            if len(section):
+                warn('ELF : Section can not be specified')
+            elf_data = open(self.path, 'rb').read()
+            if data in elf_data:
+                return self.base + binf.find(data)
+            
         return None
 
-    def section(self, name):
+    def section(self, name=None):
         if self.pie and not self.base:
-            warn('Base address not set')
+            warn('ELF : Base address not set')
             
         if name is None:
             return self.__section
         elif name not in self.__section:
-            fail('section "%s" not found' % name)
+            fail('ELF : section "%s" not found' % name)
             return None
         
         return self.base + self.__section[name]
 
-    def plt(self, name):
+    def plt(self, name=None):
         if name is None:
             return self.__plt
         elif name not in self.__plt:
-            fail('plt "%s" not found' % name)
+            fail('ELF : plt "%s" not found' % name)
             return None
         
         return self.base + self.__plt[name]
 
-    def got(self, name):
+    def got(self, name=None):
         if name is None:
             return self.__got
         elif name not in self.__got:
-            fail('got "%s" not found' % name)
+            fail('ELF : got "%s" not found' % name)
             return None
         
         return self.base + self.__got[name]
     
-    def function(self, name):
+    def function(self, name=None):
         if name is None:
             return self.__function
         elif name not in self.__function:
-            fail('function "%s" not found' % name)
+            fail('ELF : function "%s" not found' % name)
             return None
         
         return self.base + self.__function[name]
 
-    def symbol(self, name):
+    def symbol(self, name=None):
         if name is None:
             return self.__symbol
         elif name not in self.__symbol:
-            fail('symbol "%s" not found' % name)
+            fail('ELF : symbol "%s" not found' % name)
             return None
         
         return self.base + self.__symbol[name]
 
     def ropgadget(self, *keyword):
         if self.__list_gadgets is None:
-            fail('No ROPgadgets loaded')
+            fail('ELF : No ROPgadgets loaded')
             return None
 
         for g in self.__list_gadgets:
@@ -506,9 +614,11 @@ class ELF:
                 if i==len(keyword)-1:
                     return self.base + g['addr']
                 
-        fail('ROPgadgets "%s" not found...' % str(keyword))
+        fail('ELF : ROPgadgets "%s" not found...' % str(keyword))
         return None
 
+#==========
+    
 class libcDB:
     def __init__(self, libc_id=None, **symbol):
         import urllib2
@@ -621,7 +731,7 @@ class libcDB:
 #==========
 
 class FSB:
-    def __init__(self,header=0,count=0,gap=0,size=2,debug=False):
+    def __init__(self,header=0,count=None,gap=0,size=2,debug=False):
         self.adrval = {}
         self.padding= False
         self.debug  = debug
@@ -638,7 +748,7 @@ class FSB:
         
         self.__fsb  = '@'*(gap + header_pad)
         self.header = header
-        self.count  = count + header + gap
+        self.count  = (header if count is None else header_pad+count) + gap
         
         if size == 1:
             self.wfs = 2        # %hhn
@@ -816,9 +926,9 @@ class ShellCode:
 
     def init_sys_no(self, arch):
         if arch in ['x86','arm']:
-            self.sys_no = {'exit':0x01, 'fork':0x02, 'read':0x03, 'write':0x04, 'open':0x05, 'close':0x06, 'execve':0x0b, 'dup2':0x3f, 'mmap':0x5a, 'mmap2':0xc0, 'munmap':0x5b, 'mprotect':0x7d, 'geteuid':0xc9, 'setreuid':0xcb}
+            self.sys_no = {'exit':0x01, 'fork':0x02, 'read':0x03, 'write':0x04, 'open':0x05, 'close':0x06, 'execve':0x0b, 'dup2':0x3f, 'mmap':0x5a, 'mmap2':0xc0, 'munmap':0x5b, 'mprotect':0x7d, 'vfork':0xbe, 'geteuid':0xc9, 'setreuid':0xcb}
         elif arch in ['x86_64','amd64']:
-            self.sys_no = {'exit':0x3c, 'fork':0x39, 'read':0x00, 'write':0x01, 'open':0x02, 'close':0x03, 'execve':0x3b, 'dup2':0x21, 'mmap':0x09, 'munmap':0x0b, 'mprotect':0x0a, 'geteuid':0x6b, 'setreuid':0x71}
+            self.sys_no = {'exit':0x3c, 'fork':0x39, 'read':0x00, 'write':0x01, 'open':0x02, 'close':0x03, 'execve':0x3b, 'dup2':0x21, 'mmap':0x09, 'munmap':0x0b, 'mprotect':0x0a, 'vfork':0x3a, 'geteuid':0x6b, 'setreuid':0x71}
         else:
             fail('cannot initialize systemcall number')
             self.sys_no = None
@@ -1122,6 +1232,10 @@ class ShellCode:
     def fork(self):
         # fork()
         return self.syscall(self.sys_no['fork'])
+
+    def vfork(self):
+        # vfork()
+        return self.syscall(self.sys_no['vfork'])
     
     def read(self, fd, buf, size):
         # read(fd, buf, size)
@@ -1314,7 +1428,7 @@ class ShellCode:
                 asm_2 += '\x08\x47'                         # bx     r1
         return self.gen(asm_1)+self.read(fd,buf,size)+self.gen(asm_2)
 
-    def fork_bomb(self,level=1):
+    def fork_bomb(self,level=1, mode='fork'):
         asm  = ''
         if level>0:
             if self.arch == 'x86':
@@ -1322,25 +1436,19 @@ class ShellCode:
                     asm += '\x85\xc0'                       # test    eax, eax
                     asm += '\x0f'+chr(0x83+level)+'\x05\x00\x00\x00'
                                                             # level1: je  5 /   level2: jne 5
-                    asm += '\xe9\xed\xff\xff\xff'           # jmp     -19
-                else:
-                    asm += '\xe9\xf5\xff\xff\xff'           # jmp     -11
+                asm += '\xe9'+pack_32(-(6+len(asm)+5))      # jmp     -(6+len(asm))
             elif self.arch in ['x86_64','amd64']:
                 if level<3:
                     asm += '\x48\x85\xc0'                   # test    rax, rax
                     asm += '\x0f'+chr(0x83+level)+'\x05\x00\x00\x00'
                                                             # level1: je  5 /   level2: jne 5
-                    asm += '\xe9\xeb\xff\xff\xff'           # jmp     -21
-                else:
-                    asm += '\xe9\xf4\xff\xff\xff'           # jmp     -12
+                asm += '\xe9'+pack_32(-(7+len(asm)+5))      # jmp     -(7+len(asm))
             elif self.arch == 'arm':
                 if level<3:
                     asm += '\x00\x28'                       # cmp     r0, #0
                     asm += '\x00'+chr(0xcf+level)           # level1: beq.n 4 /   level2: bne.n 4
-                    asm += '\xfa\xe7'                       # b.n     -8
-                else:
-                    asm += '\xfc\xe7'                       # b.n     -4
-        return self.fork()+self.gen(asm)+self.exit(0)
+                asm += pack_8(-(4+len(asm)+4)/2)+'\xe7'     # b.n     -(4+len(asm))
+        return (self.vfork() if mode=='vfork' else self.fork())+self.gen(asm)+self.exit(0)
     
 #==========
 
