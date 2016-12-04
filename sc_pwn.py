@@ -54,6 +54,7 @@ rol         = lambda val, r_bits, max_bits: \
 ror         = lambda val, r_bits, max_bits: \
               ((val & (2**max_bits-1)) >> r_bits%max_bits) | \
               (val << (max_bits-(r_bits%max_bits)) & (2**max_bits-1))
+lib_path    = lambda p,l:     re.search(r'%s => ([^\s]+)' % l, LocalShell().get_output('ldd %s' % p)).group(1)
 
 #==========
 
@@ -97,11 +98,19 @@ class Environment:
     def select(self, env=None):
         if env is not None and env not in self.env_list:
             warn('Environment : "%s" is not defined' % env)
+            env = None
             
-        while env is None or env not in self.env_list:
-            env = raw_input('Select Environment\n%s ...' % str(self.env_list))
-            if env=='':
+        while env is None:
+            sel = raw_input('Select Environment\n%s ...' % str(self.env_list))
+            if not sel:
                 env = self.env_list[0]
+            elif sel in self.env_list:
+                env = sel
+            else:
+                for e in self.env_list:
+                    if e.startswith(sel):
+                        env = e
+                        break
 
         info('Environment : set environment "%s"' % env)
         for name,obj in getattr(self, env).items():
@@ -112,7 +121,37 @@ class Environment:
         return self.__env == env
 
 #==========
-            
+
+class LocalShell:
+    def __init__(self, env=None):
+        from subprocess import call, check_output
+
+        self.__call         = call
+        self.__check_output = check_output
+        self.env            = env
+
+    def call(self, cmd, output=True):
+        cmd = cmd.split(' ')
+        if not output:
+            devnull = open(os.devnull, 'w')
+            ret = self.__call(cmd, stdout=devnull, stderr=devnull, env=self.env)
+            devnull.close()
+        else:
+            ret = self.__call(cmd, env=self.env)
+        return ret
+
+    def get_output(self, cmd):
+        return self.__check_output(cmd.split(' '), env=self.env)
+
+    def exists(self, cmd):
+        try:
+            self.call(cmd, False)
+            return True
+        except:
+            return False
+
+#==========
+        
 class Communicate:    
     def __init__(self, target, mode='SOCKET', disp=True, **args):
         self.disp = disp
@@ -152,6 +191,8 @@ class Communicate:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(args['to'] if 'to' in args else 1.0)
             self.sock.connect(rhp)
+
+            self.timeout = socket.timeout
             
         elif self.mode=='LOCAL':
             import subprocess
@@ -179,9 +220,12 @@ class Communicate:
                 proc(self.read_until()[:-1])
                 info(self.read_until()[:-1])
                 raw_input('Enter any key to continue...')
+
+            self.timeout = None
             
         elif self.mode=='SSH':
             import paramiko
+            import socket
             
             if self.disp:
                 proc('Connect SSH to %s@%s:%d' % (target['username'],target['host'],target['port']))
@@ -190,13 +234,15 @@ class Communicate:
             self.ssh.connect(target['host'], username=target['username'], password=target['password'], port=target['port'])
             self.channel = self.ssh.get_transport().open_session()
             self.channel.settimeout(args['to'] if 'to' in args else 1.0)
-            self.channel.get_pty()
+            #self.channel.get_pty()
             if 'program' in target:
                 if 'ASLR' in args and args['ASLR']==False:
                     target['program'] = 'ulimit -s unlimited; %s setarch i386 -R %s' % (env_str, target['program'])
                 elif env_str:
                     target['program'] = '%s %s' % (env_str, target['program'])
                 self.channel.exec_command(target['program'])
+
+            self.timeout = socket.timeout
 
     def set_show(self, mode=None):
         if mode in ['RAW', 'HEXDUMP']:
@@ -238,7 +284,7 @@ class Communicate:
                 self.proc.stdin.write(msg)
             elif self.mode=='SSH':
                 self.channel.sendall(msg)
-        except:
+        except StandardError:
             self.is_alive = False
 
     def sendln(self,msg):
@@ -257,7 +303,7 @@ class Communicate:
                 rsp = self.proc.stdout.read(num)
             elif self.mode=='SSH':
                 rsp = self.channel.recv(num)
-        except:
+        except StandardError:
             pass
 
         if self.show_mode is not None:
@@ -280,7 +326,7 @@ class Communicate:
                     rsp += rcv
                 else:
                     break
-        except:
+        except StandardError:
             pass
         
         if self.show_mode is not None:
@@ -289,17 +335,20 @@ class Communicate:
 
     def read_until(self,term='\n',contain=True):
         rsp = ''
-        try:
-            while not (rsp.endswith(term) if isinstance(term, str) else any([rsp.endswith(x) for x in term])):
+        while not (rsp.endswith(term) if isinstance(term, str) else any([rsp.endswith(x) for x in term])):
+            try:
                 if self.mode=='SOCKET':
                     rsp += self.sock.recv(1) 
                 elif self.mode=='LOCAL':
                     rsp += self.proc.stdout.read(1)
                 elif self.mode=='SSH':
                     rsp += self.channel.recv(1)
-        except:
-            if not rsp.endswith(term):
-                warn('read_until: not end with "%s"(timeout)' % term)
+            except self.timeout:
+                if not (rsp.endswith(term) if isinstance(term, str) else any([rsp.endswith(x) for x in term])):
+                    warn('read_until: not end with "%s"(timeout)' % str(term).strip())
+                break
+            except StandardError:
+                sleep(0.05)
         
         if self.show_mode is not None:
             self.show('Y', 'READ', rsp)
@@ -329,7 +378,7 @@ class Communicate:
             raw_input('Enter any key to close...')
 
 #==========
-
+        
 class ELF:
     def __init__(self, path, mode='elftools', **args):
         self.path = path
@@ -352,24 +401,30 @@ class ELF:
                 self.mode = None
 
         if self.mode is None or self.mode=='binutils':
-            try:
-                from subprocess import call, check_output
-                import os
+            lshell = LocalShell({'LANG':'en'})
 
+            if lshell.exists('readelf'):
+                self.__readelf  = lambda opt: lshell.get_output('readelf %s %s' % (opt, self.path))
+                self.mode       = 'binutils'
+            else:
+                fail('ELF : command "readelf" is not callable')
+                self.mode = None
+                
+            '''
+            try:
                 devnull = open(os.devnull, 'w')
                 call('readelf', stdout=devnull, stderr=devnull)
-                #call('objdump', stdout=devnull, stderr=devnull)
-                #call('nm', stdout=devnull, stderr=devnull)
+                call('objdump', stdout=devnull, stderr=devnull)
+                call('nm', stdout=devnull, stderr=devnull)
                 devnull.close()
 
                 env = {'LANG':'en'}
                 self.__readelf  = lambda opt: check_output(['readelf', opt, self.path], env=env)
-                #self.__objdump  = lambda opt: check_output(['objdump', opt, self.path], env=env)
-                #self.__nm       = lambda opt: check_output(['nm', opt, self.path], env=env)
-                self.mode       = 'binutils'
+                self.__objdump  = lambda opt: check_output(['objdump', opt, self.path], env=env)
+                self.__nm       = lambda opt: check_output(['nm', opt, self.path], env=env)
             except:
-                fail('ELF : command "readelf" is not callable')
-                self.mode = None
+                pass
+            '''
 
         if self.mode:
             self.initialize(args)
@@ -385,7 +440,7 @@ class ELF:
             
         elif self.mode=='binutils':
             h_elf       = self.__readelf('-h')
-            pattern     = 'Type:\s+([^\n]+)\s+Machine:\s+([^\n]+)'
+            pattern     = r'Type:\s+([^\n]+)\s+Machine:\s+([^\n]+)'
 
             m = re.search(pattern, h_elf)
             self.pie    = 'DYN' in m.group(1)
@@ -411,7 +466,7 @@ class ELF:
                 
         elif self.mode=='binutils':
             h_sections  = self.__readelf('-S')
-            pattern     = '\d] ([^ ]+)\D+([0-9a-f]+)'
+            pattern     = r'\d] ([^ ]+)\D+([0-9a-f]+)'
 
             r = re.compile(pattern)
             for sec in r.findall(h_sections):
@@ -434,7 +489,7 @@ class ELF:
 
         elif self.mode=='binutils':
             h_reloc     = self.__readelf('-r')
-            pattern     = '([0-9a-f]+)  ([^ ]+[ ]+){3}(\w+)'
+            pattern     = r'([0-9a-f]+)  ([^ ]+[ ]+){3}(\w+)'
             
             for header in h_reloc.split('Relocation section'):
                 if name_rel_plt in header:
@@ -483,7 +538,7 @@ class ELF:
 
         elif self.mode=='binutils':
             h_symbol    = self.__readelf('-s')
-            pattern     = '\d+: ([0-9a-f]+)\s+\d+ (\w+)\D+\d+ ([^\s@]+)'
+            pattern     = r'\d+: ([0-9a-f]+)\s+\d+ (\w+)\D+\d+ ([^\s@]+)'
 
             r = re.compile(pattern)
             for sym in r.findall(h_symbol):
