@@ -54,7 +54,7 @@ rol         = lambda val, r_bits, max_bits: \
 ror         = lambda val, r_bits, max_bits: \
               ((val & (2**max_bits-1)) >> r_bits%max_bits) | \
               (val << (max_bits-(r_bits%max_bits)) & (2**max_bits-1))
-lib_path    = lambda p,l:     re.search(r'%s => ([^\s]+)' % l, LocalShell().get_output('ldd %s' % p)).group(1)
+lib_path    = lambda p,l:     re.search(r'%s => ([^\s]+)' % l, LocalShell().get_output('ldd %s' % p)).group(1) if LocalShell().exists('ldd') else None
 
 #==========
 
@@ -208,7 +208,8 @@ class Communicate:
                 target['program'] = 'ulimit -s unlimited; %s setarch i386 -R %s' % (env_str, target['program'])
             else:
                 shell = False
-                target['program'] = target['program'].split(' ')
+                if isinstance(target['program'], str):
+                    target['program'] = target['program'].split(' ')
 
             self.wait = ('wait' in args and args['wait'])
                 
@@ -403,28 +404,15 @@ class ELF:
         if self.mode is None or self.mode=='binutils':
             lshell = LocalShell({'LANG':'en'})
 
+            #if lshell.exists('readelf') and lshell.exists('objdump') and lshell.exists('nm'):
             if lshell.exists('readelf'):
                 self.__readelf  = lambda opt: lshell.get_output('readelf %s %s' % (opt, self.path))
+                #self.__objdump  = lambda opt: lshell.get_output('objdump %s %s' % (opt, self.path))
+                #self.__nm       = lambda opt: lshell.get_output('nm %s %s' % (opt, self.path))
                 self.mode       = 'binutils'
             else:
                 fail('ELF : command "readelf" is not callable')
                 self.mode = None
-                
-            '''
-            try:
-                devnull = open(os.devnull, 'w')
-                call('readelf', stdout=devnull, stderr=devnull)
-                call('objdump', stdout=devnull, stderr=devnull)
-                call('nm', stdout=devnull, stderr=devnull)
-                devnull.close()
-
-                env = {'LANG':'en'}
-                self.__readelf  = lambda opt: check_output(['readelf', opt, self.path], env=env)
-                self.__objdump  = lambda opt: check_output(['objdump', opt, self.path], env=env)
-                self.__nm       = lambda opt: check_output(['nm', opt, self.path], env=env)
-            except:
-                pass
-            '''
 
         if self.mode:
             self.initialize(args)
