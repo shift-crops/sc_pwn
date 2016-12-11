@@ -464,29 +464,28 @@ class ELF:
 
     def init_got(self):
         got = dict()
+        name_rel_dyn = '.rel.dyn' if self.arch in ['x86', '80386'] else '.rela.dyn'
         name_rel_plt = '.rel.plt' if self.arch in ['x86', '80386'] else '.rela.plt'
 
         if self.mode=='elftools':
-            sec_rel_plt = self.elf.get_section_by_name(name_rel_plt)
-            sym_rel_plt = self.__list_sections[sec_rel_plt.header.sh_link]
+            for name_rel in [name_rel_dyn, name_rel_plt]:               
+                sec_rel = self.elf.get_section_by_name(name_rel)
+                if sec_rel:
+                    sym_rel = self.__list_sections[sec_rel.header.sh_link]
 
-            for rel in sec_rel_plt.iter_relocations():
-                sym_idx = rel.entry.r_info_sym
-                sym     = sym_rel_plt.get_symbol(sym_idx)
-                got[sym.name]  = rel.entry.r_offset
+                    for rel in sec_rel.iter_relocations():
+                        sym_idx = rel.entry.r_info_sym
+                        sym     = sym_rel.get_symbol(sym_idx)
+                        got[sym.name]  = rel.entry.r_offset
 
         elif self.mode=='binutils':
             h_reloc     = self.__readelf('-r')
             pattern     = r'([0-9a-f]+)  ([^ ]+[ ]+){3}(\w+)'
             
-            for header in h_reloc.split('Relocation section'):
-                if name_rel_plt in header:
-                    h_rel_plt = header
-                    break
-
-            r = re.compile(pattern)
-            for rel in r.findall(h_rel_plt):
-                got[rel[2]]  = int(rel[0],16)
+            for h_rel in h_reloc.split('Relocation section'):
+                r = re.compile(pattern)
+                for rel in r.findall(h_rel):
+                    got[rel[2]]  = int(rel[0],16)
                 
         return got
 
